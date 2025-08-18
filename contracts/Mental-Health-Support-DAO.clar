@@ -10,12 +10,15 @@
 (define-constant err-already-registered (err u106))
 (define-constant err-invalid-vote (err u107))
 (define-constant err-insufficient-votes (err u108))
+(define-constant err-insufficient-reputation (err u109))
+(define-constant err-reputation-not-found (err u110))
 
 (define-data-var total-supply uint u0)
 (define-data-var content-counter uint u0)
 (define-data-var voting-period uint u1440)
 (define-data-var min-vote-threshold uint u5)
 (define-data-var reward-multiplier uint u10)
+(define-data-var min-reputation-threshold uint u10)
 
 (define-map content-submissions uint {
     author: principal,
@@ -46,6 +49,14 @@
     joined-at: uint,
     voting-power: uint,
     contributions: uint
+})
+
+(define-map user-reputation principal {
+    reputation-score: uint,
+    total-votes-cast: uint,
+    quality-content-count: uint,
+    community-endorsements: uint,
+    last-updated: uint
 })
 
 (define-read-only (get-balance (account principal))
@@ -96,6 +107,21 @@
 (define-read-only (get-content-counter)
     (var-get content-counter))
 
+(define-read-only (get-user-reputation (user principal))
+    (default-to {
+        reputation-score: u0,
+        total-votes-cast: u0,
+        quality-content-count: u0,
+        community-endorsements: u0,
+        last-updated: u0
+    } (map-get? user-reputation user)))
+
+(define-read-only (get-reputation-score (user principal))
+    (get reputation-score (get-user-reputation user)))
+
+(define-read-only (has-min-reputation (user principal))
+    (>= (get-reputation-score user) (var-get min-reputation-threshold)))
+
 (define-private (mint-tokens (recipient principal) (amount uint))
     (begin
         (try! (ft-mint? mh-support-token amount recipient))
@@ -110,6 +136,17 @@
         (map-set user-balances sender (- sender-balance amount))
         (map-set user-balances recipient (+ (get-balance recipient) amount))
         (ok true)))
+
+(define-private (update-reputation (user principal) (reputation-change uint) (activity-type (string-ascii 20)))
+    (let ((current-rep (get-user-reputation user)))
+        (let ((new-score (+ (get reputation-score current-rep) reputation-change)))
+            (map-set user-reputation user (merge current-rep {
+                reputation-score: new-score,
+                last-updated: stacks-block-height
+            }))
+            (ok new-score))))
+
+
 
 (define-public (submit-content (title (string-ascii 100)) (content-hash (string-ascii 64)) (anonymous bool))
     (let ((content-id (+ (var-get content-counter) u1)))
@@ -139,6 +176,11 @@
             })
             (map-set content-submissions content-id 
                 (merge content-data {vote-count: (+ (get vote-count content-data) u1)}))
+            (let ((voter-rep (get-user-reputation tx-sender)))
+                (map-set user-reputation tx-sender (merge voter-rep {
+                    total-votes-cast: (+ (get total-votes-cast voter-rep) u1)
+                })))
+            (unwrap! (update-reputation tx-sender u1 "vote") err-insufficient-reputation)
             (ok true))))
 
 (define-public (finalize-voting (content-id uint))
@@ -152,6 +194,11 @@
                     (try! (mint-tokens author reward-amount))
                     (map-set content-submissions content-id 
                         (merge content-data {total-reward: reward-amount, status: "rewarded"}))
+                    (let ((author-rep (get-user-reputation author)))
+                        (map-set user-reputation author (merge author-rep {
+                            quality-content-count: (+ (get quality-content-count author-rep) u1)
+                        })))
+                    (unwrap! (update-reputation author u5 "content-reward") err-insufficient-reputation)
                     (ok reward-amount))))))
 
 (define-public (register-professional (specialization (string-ascii 50)))
@@ -254,7 +301,7 @@
                     (map-set dao-members member 
                         (merge member-data {voting-power: (+ (get voting-power member-data) additional-power)}))
                     (ok true))
-            (err u109))))
+            (err u111))))
 
 (define-public (update-member-contributions (member principal))
     (match (get-dao-member-info member)
@@ -277,3 +324,40 @@
         content-count: (var-get content-counter),
         voting-period: (var-get voting-period)
     }))
+
+(define-public (endorse-user (target-user principal))
+    (begin
+        (asserts! (has-min-reputation tx-sender) err-insufficient-reputation)
+        (asserts! (not (is-eq tx-sender target-user)) err-invalid-vote)
+        (let ((target-rep (get-user-reputation target-user)))
+            (begin
+                (map-set user-reputation target-user (merge target-rep {
+                    community-endorsements: (+ (get community-endorsements target-rep) u1)
+                }))
+                (unwrap! (update-reputation target-user u3 "endorsement") err-insufficient-reputation)
+                (ok true)))))
+
+(define-public (reputation-weighted-vote (proposal-id uint) (support bool))
+    (let ((voter-reputation (get-reputation-score tx-sender)))
+        (begin
+            (asserts! (has-min-reputation tx-sender) err-insufficient-reputation)
+            (let ((weighted-power (/ (* voter-reputation u2) u10)))
+                (ok weighted-power)))))
+
+(define-public (get-reputation-tier (user principal))
+    (let ((score (get-reputation-score user)))
+        (if (>= score u100)
+            (ok "expert")
+            (if (>= score u50)
+                (ok "advanced")
+                (if (>= score u20)
+                    (ok "intermediate")
+                    (if (>= score u5)
+                        (ok "beginner")
+                        (ok "newcomer")))))))
+
+(define-public (update-reputation-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set min-reputation-threshold new-threshold)
+        (ok true)))
