@@ -12,6 +12,8 @@
 (define-constant err-insufficient-votes (err u108))
 (define-constant err-insufficient-reputation (err u109))
 (define-constant err-reputation-not-found (err u110))
+(define-constant err-milestone-already-claimed (err u111))
+(define-constant err-milestone-not-reached (err u112))
 
 (define-data-var total-supply uint u0)
 (define-data-var content-counter uint u0)
@@ -19,6 +21,7 @@
 (define-data-var min-vote-threshold uint u5)
 (define-data-var reward-multiplier uint u10)
 (define-data-var min-reputation-threshold uint u10)
+(define-data-var milestone-counter uint u0)
 
 (define-map content-submissions uint {
     author: principal,
@@ -57,6 +60,28 @@
     quality-content-count: uint,
     community-endorsements: uint,
     last-updated: uint
+})
+
+(define-map milestone-definitions uint {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    requirement-type: (string-ascii 20),
+    threshold-value: uint,
+    reward-amount: uint,
+    badge-tier: uint,
+    active: bool
+})
+
+(define-map user-milestones {user: principal, milestone-id: uint} {
+    achieved-at: uint,
+    claimed: bool
+})
+
+(define-map user-milestone-progress principal {
+    total-milestones-achieved: uint,
+    total-rewards-claimed: uint,
+    highest-badge-tier: uint,
+    last-milestone-at: uint
 })
 
 (define-read-only (get-balance (account principal))
@@ -122,6 +147,45 @@
 (define-read-only (has-min-reputation (user principal))
     (>= (get-reputation-score user) (var-get min-reputation-threshold)))
 
+(define-read-only (get-milestone-definition (milestone-id uint))
+    (map-get? milestone-definitions milestone-id))
+
+(define-read-only (get-user-milestone-progress (user principal))
+    (default-to {
+        total-milestones-achieved: u0,
+        total-rewards-claimed: u0,
+        highest-badge-tier: u0,
+        last-milestone-at: u0
+    } (map-get? user-milestone-progress user)))
+
+(define-read-only (has-achieved-milestone (user principal) (milestone-id uint))
+    (is-some (map-get? user-milestones {user: user, milestone-id: milestone-id})))
+
+(define-read-only (get-user-milestone-status (user principal) (milestone-id uint))
+    (map-get? user-milestones {user: user, milestone-id: milestone-id}))
+
+(define-read-only (check-milestone-eligibility (user principal) (milestone-id uint))
+    (match (get-milestone-definition milestone-id)
+        milestone-data
+            (let ((req-type (get requirement-type milestone-data))
+                  (threshold (get threshold-value milestone-data))
+                  (user-rep (get-user-reputation user))
+                  (dao-member (get-dao-member-info user)))
+                (if (is-eq req-type "reputation")
+                    (>= (get reputation-score user-rep) threshold)
+                    (if (is-eq req-type "votes-cast")
+                        (>= (get total-votes-cast user-rep) threshold)
+                        (if (is-eq req-type "content-count")
+                            (>= (get quality-content-count user-rep) threshold)
+                            (if (is-eq req-type "endorsements")
+                                (>= (get community-endorsements user-rep) threshold)
+                                (if (is-eq req-type "contributions")
+                                    (match dao-member
+                                        member-data (>= (get contributions member-data) threshold)
+                                        false)
+                                    false))))))
+        false))
+
 (define-private (mint-tokens (recipient principal) (amount uint))
     (begin
         (try! (ft-mint? mh-support-token amount recipient))
@@ -182,6 +246,16 @@
                 })))
             (unwrap! (update-reputation tx-sender u1 "vote") err-insufficient-reputation)
             (ok true))))
+
+(define-private (update-milestone-progress (user principal) (milestone-id uint) (reward-amount uint) (badge-tier uint))
+    (let ((current-progress (get-user-milestone-progress user)))
+        (map-set user-milestone-progress user (merge current-progress {
+            total-milestones-achieved: (+ (get total-milestones-achieved current-progress) u1),
+            total-rewards-claimed: (+ (get total-rewards-claimed current-progress) reward-amount),
+            highest-badge-tier: (if (> badge-tier (get highest-badge-tier current-progress)) badge-tier (get highest-badge-tier current-progress)),
+            last-milestone-at: stacks-block-height
+        }))
+        (ok true)))
 
 (define-public (finalize-voting (content-id uint))
     (let ((content-data (unwrap! (get-content content-id) err-content-not-found)))
@@ -301,7 +375,7 @@
                     (map-set dao-members member 
                         (merge member-data {voting-power: (+ (get voting-power member-data) additional-power)}))
                     (ok true))
-            (err u111))))
+            (err u113))))
 
 (define-public (update-member-contributions (member principal))
     (match (get-dao-member-info member)
@@ -361,3 +435,63 @@
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set min-reputation-threshold new-threshold)
         (ok true)))
+
+(define-public (create-milestone (name (string-ascii 50)) (description (string-ascii 200)) (requirement-type (string-ascii 20)) (threshold-value uint) (reward-amount uint) (badge-tier uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((milestone-id (+ (var-get milestone-counter) u1)))
+            (begin
+                (map-set milestone-definitions milestone-id {
+                    name: name,
+                    description: description,
+                    requirement-type: requirement-type,
+                    threshold-value: threshold-value,
+                    reward-amount: reward-amount,
+                    badge-tier: badge-tier,
+                    active: true
+                })
+                (var-set milestone-counter milestone-id)
+                (ok milestone-id)))))
+
+(define-public (claim-milestone-reward (milestone-id uint))
+    (let ((milestone-data (unwrap! (get-milestone-definition milestone-id) err-content-not-found)))
+        (begin
+            (asserts! (get active milestone-data) err-voting-closed)
+            (asserts! (not (has-achieved-milestone tx-sender milestone-id)) err-milestone-already-claimed)
+            (asserts! (check-milestone-eligibility tx-sender milestone-id) err-milestone-not-reached)
+            (let ((reward-amount (get reward-amount milestone-data))
+                  (badge-tier (get badge-tier milestone-data)))
+                (begin
+                    (try! (mint-tokens tx-sender reward-amount))
+                    (map-set user-milestones {user: tx-sender, milestone-id: milestone-id} {
+                        achieved-at: stacks-block-height,
+                        claimed: true
+                    })
+                    (unwrap! (update-milestone-progress tx-sender milestone-id reward-amount badge-tier) err-insufficient-reputation)
+                    (unwrap! (update-reputation tx-sender (/ reward-amount u10) "milestone") err-insufficient-reputation)
+                    (ok reward-amount))))))
+
+(define-public (toggle-milestone-status (milestone-id uint) (active bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((milestone-data (unwrap! (get-milestone-definition milestone-id) err-content-not-found)))
+            (begin
+                (map-set milestone-definitions milestone-id 
+                    (merge milestone-data {active: active}))
+                (ok true)))))
+
+(define-public (get-available-milestones (user principal))
+    (let ((milestone-count (var-get milestone-counter)))
+        (ok milestone-count)))
+
+(define-public (bulk-check-milestones (user principal))
+    (let ((milestone-count (var-get milestone-counter))
+          (user-progress (get-user-milestone-progress user)))
+        (ok {
+            total-available: milestone-count,
+            user-achieved: (get total-milestones-achieved user-progress),
+            highest-badge: (get highest-badge-tier user-progress)
+        })))
+
+(define-public (get-milestone-leaderboard (badge-tier uint))
+    (ok badge-tier))
