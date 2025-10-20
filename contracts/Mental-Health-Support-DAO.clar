@@ -14,6 +14,10 @@
 (define-constant err-reputation-not-found (err u110))
 (define-constant err-milestone-already-claimed (err u111))
 (define-constant err-milestone-not-reached (err u112))
+(define-constant err-alert-not-found (err u113))
+(define-constant err-alert-already-resolved (err u114))
+(define-constant err-invalid-severity (err u115))
+(define-constant err-unauthorized-resolver (err u116))
 
 (define-data-var total-supply uint u0)
 (define-data-var content-counter uint u0)
@@ -22,6 +26,8 @@
 (define-data-var reward-multiplier uint u10)
 (define-data-var min-reputation-threshold uint u10)
 (define-data-var milestone-counter uint u0)
+(define-data-var crisis-alert-counter uint u0)
+(define-data-var crisis-response-time-limit uint u30)
 
 (define-map content-submissions uint {
     author: principal,
@@ -82,6 +88,35 @@
     total-rewards-claimed: uint,
     highest-badge-tier: uint,
     last-milestone-at: uint
+})
+
+(define-map crisis-alerts uint {
+    reporter: principal,
+    severity-level: uint,
+    description: (string-ascii 200),
+    contact-method: (string-ascii 50),
+    location-hint: (string-ascii 100),
+    reported-at: uint,
+    status: (string-ascii 20),
+    assigned-responder: (optional principal),
+    resolved-at: (optional uint),
+    response-time: (optional uint)
+})
+
+(define-map crisis-responders principal {
+    qualified: bool,
+    specialization: (string-ascii 50),
+    availability-status: (string-ascii 20),
+    total-responses: uint,
+    average-response-time: uint,
+    certification-level: uint,
+    last-active: uint
+})
+
+(define-map alert-responses {alert-id: uint, responder: principal} {
+    response-message: (string-ascii 300),
+    responded-at: uint,
+    follow-up-required: bool
 })
 
 (define-read-only (get-balance (account principal))
@@ -163,6 +198,31 @@
 
 (define-read-only (get-user-milestone-status (user principal) (milestone-id uint))
     (map-get? user-milestones {user: user, milestone-id: milestone-id}))
+
+(define-read-only (get-crisis-alert (alert-id uint))
+    (map-get? crisis-alerts alert-id))
+
+(define-read-only (get-crisis-responder-info (responder principal))
+    (map-get? crisis-responders responder))
+
+(define-read-only (get-alert-response (alert-id uint) (responder principal))
+    (map-get? alert-responses {alert-id: alert-id, responder: responder}))
+
+(define-read-only (get-crisis-alert-counter)
+    (var-get crisis-alert-counter))
+
+(define-read-only (is-qualified-responder (responder principal))
+    (match (get-crisis-responder-info responder)
+        responder-data (and (get qualified responder-data) (is-eq (get availability-status responder-data) "available"))
+        false))
+
+(define-read-only (get-alert-urgency-score (alert-id uint))
+    (match (get-crisis-alert alert-id)
+        alert-data
+            (let ((severity (get severity-level alert-data))
+                  (time-elapsed (- stacks-block-height (get reported-at alert-data))))
+                (+ (* severity u10) (/ time-elapsed u5)))
+        u0))
 
 (define-read-only (check-milestone-eligibility (user principal) (milestone-id uint))
     (match (get-milestone-definition milestone-id)
@@ -495,3 +555,140 @@
 
 (define-public (get-milestone-leaderboard (badge-tier uint))
     (ok badge-tier))
+
+;; === CRISIS SUPPORT ALERT SYSTEM ===
+
+(define-public (create-crisis-alert (severity-level uint) (description (string-ascii 200)) (contact-method (string-ascii 50)) (location-hint (string-ascii 100)))
+    (let ((alert-id (+ (var-get crisis-alert-counter) u1)))
+        (begin
+            (asserts! (and (>= severity-level u1) (<= severity-level u5)) err-invalid-severity)
+            (map-set crisis-alerts alert-id {
+                reporter: tx-sender,
+                severity-level: severity-level,
+                description: description,
+                contact-method: contact-method,
+                location-hint: location-hint,
+                reported-at: stacks-block-height,
+                status: "active",
+                assigned-responder: none,
+                resolved-at: none,
+                response-time: none
+            })
+            (var-set crisis-alert-counter alert-id)
+            (ok alert-id))))
+
+(define-public (register-crisis-responder (specialization (string-ascii 50)) (certification-level uint))
+    (begin
+        (map-set crisis-responders tx-sender {
+            qualified: false,
+            specialization: specialization,
+            availability-status: "available",
+            total-responses: u0,
+            average-response-time: u0,
+            certification-level: certification-level,
+            last-active: stacks-block-height
+        })
+        (ok true)))
+
+(define-public (verify-crisis-responder (responder principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((responder-data (unwrap! (get-crisis-responder-info responder) err-not-professional)))
+            (begin
+                (map-set crisis-responders responder
+                    (merge responder-data {qualified: true}))
+                (ok true)))))
+
+(define-public (respond-to-crisis-alert (alert-id uint) (response-message (string-ascii 300)) (follow-up-required bool))
+    (let ((alert-data (unwrap! (get-crisis-alert alert-id) err-alert-not-found)))
+        (begin
+            (asserts! (is-qualified-responder tx-sender) err-unauthorized-resolver)
+            (asserts! (is-eq (get status alert-data) "active") err-alert-already-resolved)
+            (let ((response-time (- stacks-block-height (get reported-at alert-data))))
+                (begin
+                    (map-set alert-responses {alert-id: alert-id, responder: tx-sender} {
+                        response-message: response-message,
+                        responded-at: stacks-block-height,
+                        follow-up-required: follow-up-required
+                    })
+                    (map-set crisis-alerts alert-id
+                        (merge alert-data {
+                            assigned-responder: (some tx-sender),
+                            response-time: (some response-time)
+                        }))
+                    (let ((responder-data (unwrap! (get-crisis-responder-info tx-sender) err-not-professional)))
+                        (map-set crisis-responders tx-sender
+                            (merge responder-data {
+                                total-responses: (+ (get total-responses responder-data) u1),
+                                last-active: stacks-block-height
+                            })))
+                    (ok response-time))))))
+
+(define-public (resolve-crisis-alert (alert-id uint) (resolution-notes (string-ascii 200)))
+    (let ((alert-data (unwrap! (get-crisis-alert alert-id) err-alert-not-found)))
+        (begin
+            (asserts! (is-eq (get status alert-data) "active") err-alert-already-resolved)
+            (asserts! (or (is-eq tx-sender contract-owner)
+                         (is-eq (some tx-sender) (get assigned-responder alert-data))) err-unauthorized-resolver)
+            (map-set crisis-alerts alert-id
+                (merge alert-data {
+                    status: "resolved",
+                    resolved-at: (some stacks-block-height)
+                }))
+            (match (get assigned-responder alert-data)
+                responder
+                    (let ((reward-amount (* (get severity-level alert-data) u50)))
+                        (unwrap! (mint-tokens responder reward-amount) err-insufficient-balance))
+                true)
+            (ok true))))
+
+(define-public (update-responder-availability (availability-status (string-ascii 20)))
+    (let ((responder-data (unwrap! (get-crisis-responder-info tx-sender) err-not-professional)))
+        (begin
+            (map-set crisis-responders tx-sender
+                (merge responder-data {
+                    availability-status: availability-status,
+                    last-active: stacks-block-height
+                }))
+            (ok true))))
+
+(define-public (escalate-crisis-alert (alert-id uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((alert-data (unwrap! (get-crisis-alert alert-id) err-alert-not-found)))
+            (begin
+                (asserts! (is-eq (get status alert-data) "active") err-alert-already-resolved)
+                (let ((time-since-report (- stacks-block-height (get reported-at alert-data))))
+                    (begin
+                        (asserts! (> time-since-report (var-get crisis-response-time-limit)) err-voting-closed)
+                        (map-set crisis-alerts alert-id
+                            (merge alert-data {
+                                severity-level: (if (< (get severity-level alert-data) u5)
+                                                   (+ (get severity-level alert-data) u1)
+                                                   u5)
+                            }))
+                        (ok true)))))))
+
+(define-public (get-active-crisis-alerts)
+    (ok (var-get crisis-alert-counter)))
+
+(define-public (get-responder-stats (responder principal))
+    (match (get-crisis-responder-info responder)
+        responder-data (ok {
+            total-responses: (get total-responses responder-data),
+            certification-level: (get certification-level responder-data),
+            availability: (get availability-status responder-data),
+            qualified: (get qualified responder-data)
+        })
+        (ok {
+            total-responses: u0,
+            certification-level: u0,
+            availability: "unavailable",
+            qualified: false
+        })))
+
+(define-public (update-crisis-response-time-limit (new-limit uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set crisis-response-time-limit new-limit)
+        (ok true)))
