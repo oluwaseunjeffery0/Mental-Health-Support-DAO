@@ -18,6 +18,14 @@
 (define-constant err-alert-already-resolved (err u114))
 (define-constant err-invalid-severity (err u115))
 (define-constant err-unauthorized-resolver (err u116))
+(define-constant err-group-not-found (err u117))
+(define-constant err-session-not-found (err u118))
+(define-constant err-group-full (err u119))
+(define-constant err-not-group-member (err u120))
+(define-constant err-already-member (err u121))
+(define-constant err-session-past (err u122))
+(define-constant err-session-not-active (err u123))
+(define-constant err-already-checked-in (err u124))
 
 (define-data-var total-supply uint u0)
 (define-data-var content-counter uint u0)
@@ -28,6 +36,10 @@
 (define-data-var milestone-counter uint u0)
 (define-data-var crisis-alert-counter uint u0)
 (define-data-var crisis-response-time-limit uint u30)
+(define-data-var support-group-counter uint u0)
+(define-data-var session-counter uint u0)
+(define-data-var max-group-size uint u50)
+(define-data-var min-attendance-reward uint u5)
 
 (define-map content-submissions uint {
     author: principal,
@@ -117,6 +129,52 @@
     response-message: (string-ascii 300),
     responded-at: uint,
     follow-up-required: bool
+})
+
+(define-map support-groups uint {
+    name: (string-ascii 100),
+    description: (string-ascii 300),
+    facilitator: principal,
+    category: (string-ascii 50),
+    max-members: uint,
+    current-members: uint,
+    created-at: uint,
+    active: bool,
+    total-sessions: uint,
+    privacy-level: (string-ascii 20)
+})
+
+(define-map group-members {group-id: uint, member: principal} {
+    joined-at: uint,
+    sessions-attended: uint,
+    contribution-score: uint,
+    role: (string-ascii 20)
+})
+
+(define-map group-sessions uint {
+    group-id: uint,
+    title: (string-ascii 100),
+    scheduled-at: uint,
+    duration-blocks: uint,
+    facilitator: principal,
+    max-participants: uint,
+    current-participants: uint,
+    status: (string-ascii 20),
+    session-type: (string-ascii 30)
+})
+
+(define-map session-attendance {session-id: uint, participant: principal} {
+    checked-in-at: uint,
+    participation-rating: uint,
+    feedback-provided: bool
+})
+
+(define-map group-statistics principal {
+    groups-created: uint,
+    groups-joined: uint,
+    total-sessions-attended: uint,
+    facilitation-hours: uint,
+    peer-support-score: uint
 })
 
 (define-read-only (get-balance (account principal))
@@ -223,6 +281,33 @@
                   (time-elapsed (- stacks-block-height (get reported-at alert-data))))
                 (+ (* severity u10) (/ time-elapsed u5)))
         u0))
+
+(define-read-only (get-support-group (group-id uint))
+    (map-get? support-groups group-id))
+
+(define-read-only (get-group-member-info (group-id uint) (member principal))
+    (map-get? group-members {group-id: group-id, member: member}))
+
+(define-read-only (is-group-member (group-id uint) (member principal))
+    (is-some (get-group-member-info group-id member)))
+
+(define-read-only (get-session-info (session-id uint))
+    (map-get? group-sessions session-id))
+
+(define-read-only (get-session-attendance (session-id uint) (participant principal))
+    (map-get? session-attendance {session-id: session-id, participant: participant}))
+
+(define-read-only (get-user-group-stats (user principal))
+    (default-to {
+        groups-created: u0,
+        groups-joined: u0,
+        total-sessions-attended: u0,
+        facilitation-hours: u0,
+        peer-support-score: u0
+    } (map-get? group-statistics user)))
+
+(define-read-only (calculate-session-reward (sessions-attended uint))
+    (+ (var-get min-attendance-reward) (* sessions-attended u2)))
 
 (define-read-only (check-milestone-eligibility (user principal) (milestone-id uint))
     (match (get-milestone-definition milestone-id)
@@ -692,3 +777,175 @@
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (var-set crisis-response-time-limit new-limit)
         (ok true)))
+
+(define-public (create-support-group (name (string-ascii 100)) (description (string-ascii 300)) (category (string-ascii 50)) (max-members uint) (privacy-level (string-ascii 20)))
+    (let ((group-id (+ (var-get support-group-counter) u1)))
+        (begin
+            (asserts! (<= max-members (var-get max-group-size)) err-group-full)
+            (map-set support-groups group-id {
+                name: name,
+                description: description,
+                facilitator: tx-sender,
+                category: category,
+                max-members: max-members,
+                current-members: u1,
+                created-at: stacks-block-height,
+                active: true,
+                total-sessions: u0,
+                privacy-level: privacy-level
+            })
+            (map-set group-members {group-id: group-id, member: tx-sender} {
+                joined-at: stacks-block-height,
+                sessions-attended: u0,
+                contribution-score: u0,
+                role: "facilitator"
+            })
+            (let ((user-stats (get-user-group-stats tx-sender)))
+                (map-set group-statistics tx-sender (merge user-stats {
+                    groups-created: (+ (get groups-created user-stats) u1),
+                    groups-joined: (+ (get groups-joined user-stats) u1)
+                })))
+            (var-set support-group-counter group-id)
+            (ok group-id))))
+
+(define-public (join-support-group (group-id uint))
+    (let ((group-data (unwrap! (get-support-group group-id) err-group-not-found)))
+        (begin
+            (asserts! (get active group-data) err-voting-closed)
+            (asserts! (not (is-group-member group-id tx-sender)) err-already-member)
+            (asserts! (< (get current-members group-data) (get max-members group-data)) err-group-full)
+            (map-set group-members {group-id: group-id, member: tx-sender} {
+                joined-at: stacks-block-height,
+                sessions-attended: u0,
+                contribution-score: u0,
+                role: "member"
+            })
+            (map-set support-groups group-id
+                (merge group-data {current-members: (+ (get current-members group-data) u1)}))
+            (let ((user-stats (get-user-group-stats tx-sender)))
+                (map-set group-statistics tx-sender (merge user-stats {
+                    groups-joined: (+ (get groups-joined user-stats) u1)
+                })))
+            (ok true))))
+
+(define-public (schedule-group-session (group-id uint) (title (string-ascii 100)) (scheduled-at uint) (duration-blocks uint) (max-participants uint) (session-type (string-ascii 30)))
+    (let ((group-data (unwrap! (get-support-group group-id) err-group-not-found))
+          (session-id (+ (var-get session-counter) u1)))
+        (begin
+            (asserts! (is-group-member group-id tx-sender) err-not-group-member)
+            (asserts! (> scheduled-at stacks-block-height) err-session-past)
+            (map-set group-sessions session-id {
+                group-id: group-id,
+                title: title,
+                scheduled-at: scheduled-at,
+                duration-blocks: duration-blocks,
+                facilitator: tx-sender,
+                max-participants: max-participants,
+                current-participants: u0,
+                status: "scheduled",
+                session-type: session-type
+            })
+            (map-set support-groups group-id
+                (merge group-data {total-sessions: (+ (get total-sessions group-data) u1)}))
+            (var-set session-counter session-id)
+            (ok session-id))))
+
+(define-public (check-in-session (session-id uint))
+    (let ((session-data (unwrap! (get-session-info session-id) err-session-not-found))
+          (group-id (get group-id session-data)))
+        (begin
+            (asserts! (is-group-member group-id tx-sender) err-not-group-member)
+            (asserts! (is-eq (get status session-data) "active") err-session-not-active)
+            (asserts! (is-none (get-session-attendance session-id tx-sender)) err-already-checked-in)
+            (asserts! (< (get current-participants session-data) (get max-participants session-data)) err-group-full)
+            (map-set session-attendance {session-id: session-id, participant: tx-sender} {
+                checked-in-at: stacks-block-height,
+                participation-rating: u0,
+                feedback-provided: false
+            })
+            (map-set group-sessions session-id
+                (merge session-data {current-participants: (+ (get current-participants session-data) u1)}))
+            (let ((member-data (unwrap! (get-group-member-info group-id tx-sender) err-not-group-member)))
+                (map-set group-members {group-id: group-id, member: tx-sender}
+                    (merge member-data {sessions-attended: (+ (get sessions-attended member-data) u1)})))
+            (let ((user-stats (get-user-group-stats tx-sender)))
+                (map-set group-statistics tx-sender (merge user-stats {
+                    total-sessions-attended: (+ (get total-sessions-attended user-stats) u1)
+                })))
+            (ok true))))
+
+(define-public (complete-session (session-id uint))
+    (let ((session-data (unwrap! (get-session-info session-id) err-session-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get facilitator session-data)) err-owner-only)
+            (asserts! (is-eq (get status session-data) "active") err-session-not-active)
+            (map-set group-sessions session-id
+                (merge session-data {status: "completed"}))
+            (let ((user-stats (get-user-group-stats tx-sender)))
+                (map-set group-statistics tx-sender (merge user-stats {
+                    facilitation-hours: (+ (get facilitation-hours user-stats) (get duration-blocks session-data))
+                })))
+            (ok true))))
+
+(define-public (rate-session-participation (session-id uint) (participant principal) (rating uint))
+    (let ((session-data (unwrap! (get-session-info session-id) err-session-not-found))
+          (group-id (get group-id session-data)))
+        (begin
+            (asserts! (is-eq tx-sender (get facilitator session-data)) err-owner-only)
+            (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-vote)
+            (let ((attendance-data (unwrap! (get-session-attendance session-id participant) err-content-not-found)))
+                (begin
+                    (map-set session-attendance {session-id: session-id, participant: participant}
+                        (merge attendance-data {participation-rating: rating}))
+                    (let ((member-data (unwrap! (get-group-member-info group-id participant) err-not-group-member)))
+                        (map-set group-members {group-id: group-id, member: participant}
+                            (merge member-data {contribution-score: (+ (get contribution-score member-data) rating)})))
+                    (ok true))))))
+
+(define-public (claim-attendance-reward (session-id uint))
+    (let ((session-data (unwrap! (get-session-info session-id) err-session-not-found))
+          (group-id (get group-id session-data))
+          (attendance-data (unwrap! (get-session-attendance session-id tx-sender) err-content-not-found)))
+        (begin
+            (asserts! (is-eq (get status session-data) "completed") err-session-not-active)
+            (let ((member-data (unwrap! (get-group-member-info group-id tx-sender) err-not-group-member))
+                  (reward-amount (calculate-session-reward (get sessions-attended member-data))))
+                (begin
+                    (try! (mint-tokens tx-sender reward-amount))
+                    (let ((user-stats (get-user-group-stats tx-sender)))
+                        (map-set group-statistics tx-sender (merge user-stats {
+                            peer-support-score: (+ (get peer-support-score user-stats) (get participation-rating attendance-data))
+                        })))
+                    (unwrap! (update-reputation tx-sender u2 "peer-support") err-insufficient-reputation)
+                    (ok reward-amount))))))
+
+(define-public (activate-session (session-id uint))
+    (let ((session-data (unwrap! (get-session-info session-id) err-session-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get facilitator session-data)) err-owner-only)
+            (asserts! (is-eq (get status session-data) "scheduled") err-session-not-active)
+            (asserts! (>= stacks-block-height (get scheduled-at session-data)) err-session-past)
+            (map-set group-sessions session-id
+                (merge session-data {status: "active"}))
+            (ok true))))
+
+(define-public (toggle-group-status (group-id uint) (active bool))
+    (let ((group-data (unwrap! (get-support-group group-id) err-group-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender (get facilitator group-data)) err-owner-only)
+            (map-set support-groups group-id
+                (merge group-data {active: active}))
+            (ok true))))
+
+(define-public (get-group-engagement-score (group-id uint))
+    (let ((group-data (unwrap! (get-support-group group-id) err-group-not-found)))
+        (ok (* (get current-members group-data) (get total-sessions group-data)))))
+
+(define-public (update-max-group-size (new-size uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set max-group-size new-size)
+        (ok true)))
+
+(define-public (get-support-group-counter)
+    (ok (var-get support-group-counter)))
